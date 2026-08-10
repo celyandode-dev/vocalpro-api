@@ -58,6 +58,7 @@ export default async function handler(req, res) {
     const quand = new Date(date_heure).toLocaleString('fr-FR', {
       dateStyle: 'full',
       timeStyle: 'short',
+      timeZone: 'Europe/Paris',
     });
     await sendSms(
       telephone,
