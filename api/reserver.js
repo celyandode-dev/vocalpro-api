@@ -1,12 +1,13 @@
 // api/reserver.js — Fonction Vercel appelée par l'agent Vapi.
-// Reçoit un RDV → le crée dans Cal.com → envoie un SMS Twilio de confirmation.
-// Déploie ce fichier dans /api/ de n'importe quel projet Vercel (Next.js ou autre).
+// Trouve le créneau LIBRE le plus proche de l'heure demandée dans Cal.com,
+// le réserve, et envoie un SMS Twilio de confirmation.
+
+const CAL_BASE = 'https://api.cal.com/v2';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'method' });
 
   try {
-    // Vapi peut envoyer les arguments de plusieurs façons — on gère les cas courants
     const body = req.body || {};
     let args =
       body?.message?.toolCalls?.[0]?.function?.arguments ??
@@ -23,28 +24,69 @@ export default async function handler(req, res) {
       });
     }
 
-    // Normalisation du fuseau : si l'heure n'a pas d'indication de fuseau,
-    // on considère qu'elle est en heure de Paris (été = +02:00).
+    // Fuseau : si l'heure n'a pas d'indication, on considère Paris (été = +02:00).
     let dt = String(date_heure).trim();
-    if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(dt)) {
-      dt = dt + '+02:00';
+    if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(dt)) dt = dt + '+02:00';
+    const requested = new Date(dt);
+    if (isNaN(requested.getTime())) {
+      return res.status(200).json({ ok: false, error: "Date non comprise, redemande le jour et l'heure." });
     }
-    const startIso = new Date(dt).toISOString();
 
-    // Normalisation du téléphone au format international E.164 (France).
     const tel = normalizeTel(telephone);
+    const eventTypeId = Number(process.env.CAL_EVENT_TYPE_ID);
 
-    // 1) Créer le RDV dans Cal.com
-    const cal = await fetch('https://api.cal.com/v2/bookings', {
+    // 1) Récupérer les créneaux LIBRES sur une fenêtre autour du jour demandé.
+    const todayStr = new Date().toISOString().slice(0, 10);
+    let startDay = dt.slice(0, 10);
+    if (startDay < todayStr) startDay = todayStr; // jamais dans le passé
+    const endObj = new Date(startDay + 'T00:00:00Z');
+    endObj.setUTCDate(endObj.getUTCDate() + 6);
+    const endDay = endObj.toISOString().slice(0, 10);
+
+    const slotsUrl = `${CAL_BASE}/slots?eventTypeId=${eventTypeId}&start=${startDay}&end=${endDay}&timeZone=Europe/Paris`;
+    const slotsRes = await fetch(slotsUrl, {
+      headers: {
+        Authorization: `Bearer ${process.env.CAL_API_KEY}`,
+        'cal-api-version': '2024-09-04',
+      },
+    });
+    const slotsJson = await slotsRes.json();
+    if (!slotsRes.ok) {
+      console.error('Cal.com slots error:', JSON.stringify(slotsJson));
+      return res.status(200).json({ ok: false, error: "Impossible de lire les disponibilités, réessaie plus tard." });
+    }
+
+    const byDay = slotsJson.data || {};
+    const sorted = Object.values(byDay)
+      .flat()
+      .map((s) => (typeof s === 'string' ? s : s.start))
+      .filter(Boolean)
+      .map((iso) => ({ iso, t: new Date(iso).getTime() }))
+      .sort((a, b) => a.t - b.t);
+
+    if (sorted.length === 0) {
+      return res.status(200).json({
+        ok: false,
+        error: "Aucun créneau libre cette semaine-là, propose une autre semaine au client.",
+      });
+    }
+
+    // Choisir le créneau libre le plus proche de la demande (à défaut, le plus tôt).
+    const reqT = requested.getTime();
+    const chosen = sorted.find((x) => x.t >= reqT) || sorted[0];
+    const exact = Math.abs(chosen.t - reqT) < 60 * 1000;
+
+    // 2) Réserver ce créneau.
+    const cal = await fetch(`${CAL_BASE}/bookings`, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${process.env.CAL_API_KEY}`,
-        'cal-api-version': process.env.CAL_API_VERSION, // valeur affichée dans la doc de l'endpoint /v2/bookings
+        'cal-api-version': process.env.CAL_API_VERSION,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        eventTypeId: Number(process.env.CAL_EVENT_TYPE_ID),
-        start: startIso,
+        eventTypeId,
+        start: new Date(chosen.iso).toISOString(),
         attendee: {
           name: nom_client,
           email: email || 'client@vocalpro.fr',
@@ -55,39 +97,35 @@ export default async function handler(req, res) {
         metadata: { prestation: prestation || '', source: 'VocalPro' },
       }),
     });
-
     const calData = await cal.json();
     if (!cal.ok) {
       console.error('Cal.com error:', JSON.stringify(calData));
-      return res.status(200).json({
-        ok: false,
-        error: "Ce créneau n'est pas disponible, propose une autre heure au client.",
-      });
+      return res.status(200).json({ ok: false, error: "Ce créneau vient d'être pris, propose une autre heure." });
     }
 
-    // 2) SMS de confirmation via Twilio
-    const quand = new Date(dt).toLocaleString('fr-FR', {
+    const quand = new Date(chosen.iso).toLocaleString('fr-FR', {
       dateStyle: 'full',
       timeStyle: 'short',
       timeZone: 'Europe/Paris',
     });
+
     await sendSms(
       tel,
       `Bonjour ${nom_client}, votre RDV ${prestation || ''} est confirmé le ${quand}. À bientôt !`
     );
 
-    // 3) Réponse que l'agent lira à voix haute
-    return res.status(200).json({
-      ok: true,
-      message: `C'est réservé pour le ${quand}. Vous recevez un SMS de confirmation.`,
-    });
+    const message = exact
+      ? `C'est réservé pour le ${quand}. Vous recevez un SMS de confirmation.`
+      : `Ce créneau n'était pas libre, je vous ai réservé le plus proche : ${quand}. Vous recevez un SMS de confirmation.`;
+
+    return res.status(200).json({ ok: true, exact, message });
   } catch (e) {
     console.error(e);
     return res.status(200).json({ ok: false, error: 'Une erreur est survenue, on réessaie.' });
   }
 }
 
-// Remet un numéro français au format international E.164 (ex. 06 12 34 56 78 -> +33612345678).
+// 06 12 34 56 78 -> +33612345678
 function normalizeTel(raw) {
   let t = String(raw || '').replace(/[\s.\-()]/g, '');
   if (t.startsWith('+')) return t;
@@ -100,7 +138,7 @@ function normalizeTel(raw) {
 async function sendSms(to, body) {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
-  const from = process.env.TWILIO_FROM; // ton numéro Twilio, ex +33756xxxxxx
+  const from = process.env.TWILIO_FROM;
   if (!sid || !token || !from) return; // SMS optionnel tant que Twilio n'est pas configuré
   const params = new URLSearchParams({ To: to, From: from, Body: body });
   await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
