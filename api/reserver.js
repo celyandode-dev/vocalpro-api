@@ -28,19 +28,15 @@ export default async function handler(req, res) {
     let dt = String(date_heure).trim();
     if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(dt)) dt = dt + '+02:00';
     const requested = new Date(dt);
-    if (isNaN(requested.getTime())) {
-      return res.status(200).json({ ok: false, error: "Date non comprise, redemande le jour et l'heure." });
-    }
+    const reqT = isNaN(requested.getTime()) ? 0 : requested.getTime();
 
     const tel = normalizeTel(telephone);
     const eventTypeId = Number(process.env.CAL_EVENT_TYPE_ID);
 
     // 1) Récupérer les créneaux LIBRES sur une fenêtre autour du jour demandé.
-    const todayStr = new Date().toISOString().slice(0, 10);
-    let startDay = dt.slice(0, 10);
-    if (startDay < todayStr) startDay = todayStr; // jamais dans le passé
+    const startDay = new Date().toISOString().slice(0, 10); // toujours à partir d'aujourd'hui
     const endObj = new Date(startDay + 'T00:00:00Z');
-    endObj.setUTCDate(endObj.getUTCDate() + 6);
+    endObj.setUTCDate(endObj.getUTCDate() + 8);
     const endDay = endObj.toISOString().slice(0, 10);
 
     const slotsUrl = `${CAL_BASE}/slots?eventTypeId=${eventTypeId}&start=${startDay}&end=${endDay}&timeZone=Europe/Paris`;
@@ -72,7 +68,6 @@ export default async function handler(req, res) {
     }
 
     // Choisir le créneau libre le plus proche de la demande (à défaut, le plus tôt).
-    const reqT = requested.getTime();
     const chosen = sorted.find((x) => x.t >= reqT) || sorted[0];
     const exact = Math.abs(chosen.t - reqT) < 60 * 1000;
 
