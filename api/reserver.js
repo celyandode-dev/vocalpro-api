@@ -1,44 +1,148 @@
-Tu es Léa, l'assistante téléphonique du Salon Élégance, un salon de coiffure à Grenoble. Tu réponds aux appels quand l'équipe est occupée. Tu es chaleureuse, efficace et naturelle : tu parles comme une vraie réceptionniste, jamais comme un robot. Tu parles UNIQUEMENT en français.
+// api/reserver.js — Fonction Vercel appelée par l'agent Vapi.
+// Trouve le créneau LIBRE le plus proche de l'heure demandée dans Cal.com,
+// le réserve, et envoie un SMS Twilio de confirmation.
 
-CONTEXTE TEMPOREL : nous sommes actuellement le {{"now" | date: "%A %d %B %Y à %H:%M", "Europe/Paris"}} (heure de Paris). Tu proposes et réserves TOUJOURS des créneaux dans le FUTUR — jamais une date ou une heure déjà passée. Quand le client dit « demain », « jeudi », « la semaine prochaine », calcule la date à partir d'aujourd'hui. Si le client donne une heure déjà passée pour aujourd'hui, propose-la pour un prochain jour d'ouverture.
+const CAL_BASE = 'https://api.cal.com/v2';
 
-FORMAT OBLIGATOIRE DE date_heure : quand tu appelles la fonction reserver_rdv, le paramètre date_heure DOIT être une date ISO 8601 stricte, avec l'année complète, calculée depuis la date d'aujourd'hui. Exemple : si nous sommes le 11 août 2026 et que le client dit « demain à 13h », tu envoies EXACTEMENT « 2026-08-12T13:00:00 ». Tu n'écris JAMAIS de texte comme « demain », « 13h » ou « après-midi » dans ce champ — uniquement la date ISO calculée. Si le client dit « après-midi » sans heure précise, choisis 14:00 ; « matin » = 10:00. Avant de réserver, répète toujours au client la date et l'heure exactes (« donc mercredi 12 août à 13h, c'est bien ça ? ») et attends son accord.
+export default async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'method' });
 
-RÈGLES IMPORTANTES
-- Phrases courtes, une idée à la fois, puis tu laisses le client répondre.
-- Confirme toujours les infos clés en les répétant (date, heure, prestation, nom).
-- N'invente jamais un prix, un créneau ou une info que tu n'as pas. Si tu ne sais pas, propose un rappel par l'équipe.
-- Si tu ne comprends pas : « Pardon, vous pouvez répéter s'il vous plaît ? »
-- Ne demande jamais d'informations sensibles (carte bancaire, etc.).
-- Quand un rendez-vous est confirmé, remercie et termine l'appel poliment.
+  try {
+    const body = req.body || {};
+    let args =
+      body?.message?.toolCalls?.[0]?.function?.arguments ??
+      body?.arguments ??
+      body;
+    if (typeof args === 'string') args = JSON.parse(args);
 
-INFOS DU SALON
-- Horaires : mardi à samedi, 9h à 19h. Fermé dimanche et lundi.
-- Adresse : 12 rue des Fleurs, 38000 Grenoble.
-- Prestations (durée / prix) : Coupe femme (45 min / 35 €), Coupe homme (30 min / 20 €), Couleur (90 min / 60 €), Balayage (120 min / 90 €), Brushing (30 min / 25 €).
-- Pour un tarif non listé, propose un rappel de l'équipe.
+    const { prestation, date_heure, nom_client, telephone, email } = args;
 
-TON RÔLE : identifier laquelle des 6 situations correspond et la traiter.
+    if (!date_heure || !nom_client || !telephone) {
+      return res.status(200).json({
+        ok: false,
+        error: 'Informations manquantes : il me faut la date, le nom et le téléphone.',
+      });
+    }
 
-1) PRENDRE UN RENDEZ-VOUS (ta mission principale)
-Récupère, une info à la fois : la prestation, puis le jour et l'horaire souhaités, puis confirme un créneau, puis le nom du client, puis son numéro de portable. Récapitule tout (« Je confirme : une coupe femme, mercredi 13 août à 14h, au nom de Marie, c'est bien ça ? »). Quand c'est confirmé, APPELLE LA FONCTION reserver_rdv avec : prestation, date_heure (au format ISO, ex. 2026-08-13T14:00:00+02:00), nom_client, telephone. Ensuite : « C'est noté, votre rendez-vous est confirmé, vous allez recevoir un SMS. Belle journée ! » Si le créneau n'est pas libre, propose-en deux autres.
+    // Fuseau : si l'heure n'a pas d'indication, on considère Paris (été = +02:00).
+    let dt = String(date_heure).trim().replace(' ', 'T');
+    if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(dt)) dt = dt + '+02:00';
+    console.log('date_heure reçu:', JSON.stringify(date_heure), '-> interprété:', dt);
+    const requested = new Date(dt);
+    const reqT = isNaN(requested.getTime()) ? 0 : requested.getTime();
 
-2) ANNULER UN RENDEZ-VOUS
-Demande le nom et le jour du rendez-vous, confirme l'annulation, puis propose d'en reprendre un autre.
+    const tel = normalizeTel(telephone);
+    const eventTypeId = Number(process.env.CAL_EVENT_TYPE_ID);
 
-3) DÉPLACER / MODIFIER
-Demande le nom et le nouveau créneau souhaité, confirme, puis traite comme une nouvelle réservation (appelle reserver_rdv).
+    // 1) Récupérer les créneaux LIBRES sur une fenêtre autour du jour demandé.
+    const startDay = new Date().toISOString().slice(0, 10); // toujours à partir d'aujourd'hui
+    const endObj = new Date(startDay + 'T00:00:00Z');
+    endObj.setUTCDate(endObj.getUTCDate() + 8);
+    const endDay = endObj.toISOString().slice(0, 10);
 
-4) RENSEIGNEMENTS
-Donne les horaires, l'adresse ou le tarif d'une prestation listée. Si l'info n'est pas connue, propose un rappel. Termine toujours par : « Souhaitez-vous que je vous prenne un rendez-vous ? »
+    const slotsUrl = `${CAL_BASE}/slots?eventTypeId=${eventTypeId}&start=${startDay}&end=${endDay}&timeZone=Europe/Paris`;
+    const slotsRes = await fetch(slotsUrl, {
+      headers: {
+        Authorization: `Bearer ${process.env.CAL_API_KEY}`,
+        'cal-api-version': '2024-09-04',
+      },
+    });
+    const slotsJson = await slotsRes.json();
+    if (!slotsRes.ok) {
+      console.error('Cal.com slots error:', JSON.stringify(slotsJson));
+      return res.status(200).json({ ok: false, error: "Impossible de lire les disponibilités, réessaie plus tard." });
+    }
 
-5) PARLER À UN HUMAIN / MESSAGE
-« L'équipe est occupée là, mais je transmets votre message et je vous fais rappeler. C'est à quel nom et quel numéro ? » Récupère nom, numéro et motif, puis confirme le rappel.
+    const byDay = slotsJson.data || {};
+    const sorted = Object.values(byDay)
+      .flat()
+      .map((s) => (typeof s === 'string' ? s : s.start))
+      .filter(Boolean)
+      .map((iso) => ({ iso, t: new Date(iso).getTime() }))
+      .sort((a, b) => a.t - b.t);
 
-6) HORS SUJET / FIN D'APPEL
-Si la demande sort de ton rôle (démarchage, urgence, question bizarre) : « Je suis l'assistante de prise de rendez-vous, je ne peux pas vous aider là-dessus, mais je transmets à l'équipe. » Puis propose un rappel ou raccroche poliment. Si le client dit au revoir : « Merci de votre appel, très bonne journée ! »
+    if (sorted.length === 0) {
+      return res.status(200).json({
+        ok: false,
+        error: "Aucun créneau libre cette semaine-là, propose une autre semaine au client.",
+      });
+    }
 
-CAS PARTICULIERS
-- Client pressé : va droit au but.
-- Date vague (« la semaine prochaine ») : demande de préciser le jour.
-- Silence : « Allô, vous m'entendez ? » ; si toujours rien, raccroche poliment.
+    // Choisir le créneau libre le plus proche de la demande (à défaut, le plus tôt).
+    const chosen = sorted.find((x) => x.t >= reqT) || sorted[0];
+    const exact = Math.abs(chosen.t - reqT) < 60 * 1000;
+
+    // 2) Réserver ce créneau.
+    const cal = await fetch(`${CAL_BASE}/bookings`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.CAL_API_KEY}`,
+        'cal-api-version': process.env.CAL_API_VERSION,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        eventTypeId,
+        start: new Date(chosen.iso).toISOString(),
+        attendee: {
+          name: nom_client,
+          email: email || 'client@vocalpro.fr',
+          phoneNumber: tel,
+          timeZone: 'Europe/Paris',
+          language: 'fr',
+        },
+        metadata: { prestation: prestation || '', source: 'VocalPro' },
+      }),
+    });
+    const calData = await cal.json();
+    if (!cal.ok) {
+      console.error('Cal.com error:', JSON.stringify(calData));
+      return res.status(200).json({ ok: false, error: "Ce créneau vient d'être pris, propose une autre heure." });
+    }
+
+    const quand = new Date(chosen.iso).toLocaleString('fr-FR', {
+      dateStyle: 'full',
+      timeStyle: 'short',
+      timeZone: 'Europe/Paris',
+    });
+
+    await sendSms(
+      tel,
+      `Bonjour ${nom_client}, votre RDV ${prestation || ''} est confirmé le ${quand}. À bientôt !`
+    );
+
+    const message = exact
+      ? `C'est réservé pour le ${quand}. Vous recevez un SMS de confirmation.`
+      : `Ce créneau n'était pas libre, je vous ai réservé le plus proche : ${quand}. Vous recevez un SMS de confirmation.`;
+
+    return res.status(200).json({ ok: true, exact, message });
+  } catch (e) {
+    console.error(e);
+    return res.status(200).json({ ok: false, error: 'Une erreur est survenue, on réessaie.' });
+  }
+}
+
+// 06 12 34 56 78 -> +33612345678
+function normalizeTel(raw) {
+  let t = String(raw || '').replace(/[\s.\-()]/g, '');
+  if (t.startsWith('+')) return t;
+  if (t.startsWith('00')) return '+' + t.slice(2);
+  if (t.startsWith('0')) return '+33' + t.slice(1);
+  if (t.startsWith('33')) return '+' + t;
+  return t;
+}
+
+async function sendSms(to, body) {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  const from = process.env.TWILIO_FROM;
+  if (!sid || !token || !from) return; // SMS optionnel tant que Twilio n'est pas configuré
+  const params = new URLSearchParams({ To: to, From: from, Body: body });
+  await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`, {
+    method: 'POST',
+    headers: {
+      Authorization: 'Basic ' + Buffer.from(`${sid}:${token}`).toString('base64'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params.toString(),
+  });
+}
