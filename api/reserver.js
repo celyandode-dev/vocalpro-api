@@ -23,6 +23,14 @@ export default async function handler(req, res) {
       });
     }
 
+    // Normalisation du fuseau : si l'heure n'a pas d'indication de fuseau,
+    // on considère qu'elle est en heure de Paris (été = +02:00).
+    let dt = String(date_heure).trim();
+    if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(dt)) {
+      dt = dt + '+02:00';
+    }
+    const startIso = new Date(dt).toISOString();
+
     // 1) Créer le RDV dans Cal.com
     const cal = await fetch('https://api.cal.com/v2/bookings', {
       method: 'POST',
@@ -33,7 +41,7 @@ export default async function handler(req, res) {
       },
       body: JSON.stringify({
         eventTypeId: Number(process.env.CAL_EVENT_TYPE_ID),
-        start: new Date(date_heure).toISOString(),
+        start: startIso,
         attendee: {
           name: nom_client,
           email: email || 'client@vocalpro.fr',
@@ -55,7 +63,7 @@ export default async function handler(req, res) {
     }
 
     // 2) SMS de confirmation via Twilio
-    const quand = new Date(date_heure).toLocaleString('fr-FR', {
+    const quand = new Date(dt).toLocaleString('fr-FR', {
       dateStyle: 'full',
       timeStyle: 'short',
       timeZone: 'Europe/Paris',
