@@ -31,6 +31,9 @@ export default async function handler(req, res) {
     }
     const startIso = new Date(dt).toISOString();
 
+    // Normalisation du téléphone au format international E.164 (France).
+    const tel = normalizeTel(telephone);
+
     // 1) Créer le RDV dans Cal.com
     const cal = await fetch('https://api.cal.com/v2/bookings', {
       method: 'POST',
@@ -45,7 +48,7 @@ export default async function handler(req, res) {
         attendee: {
           name: nom_client,
           email: email || 'client@vocalpro.fr',
-          phoneNumber: telephone,
+          phoneNumber: tel,
           timeZone: 'Europe/Paris',
           language: 'fr',
         },
@@ -69,7 +72,7 @@ export default async function handler(req, res) {
       timeZone: 'Europe/Paris',
     });
     await sendSms(
-      telephone,
+      tel,
       `Bonjour ${nom_client}, votre RDV ${prestation || ''} est confirmé le ${quand}. À bientôt !`
     );
 
@@ -82,6 +85,16 @@ export default async function handler(req, res) {
     console.error(e);
     return res.status(200).json({ ok: false, error: 'Une erreur est survenue, on réessaie.' });
   }
+}
+
+// Remet un numéro français au format international E.164 (ex. 06 12 34 56 78 -> +33612345678).
+function normalizeTel(raw) {
+  let t = String(raw || '').replace(/[\s.\-()]/g, '');
+  if (t.startsWith('+')) return t;
+  if (t.startsWith('00')) return '+' + t.slice(2);
+  if (t.startsWith('0')) return '+33' + t.slice(1);
+  if (t.startsWith('33')) return '+' + t;
+  return t;
 }
 
 async function sendSms(to, body) {
